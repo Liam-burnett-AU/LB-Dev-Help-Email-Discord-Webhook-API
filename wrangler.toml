@@ -1,7 +1,7 @@
 # wrangler.toml
 name = 'help-lbdev-tech--webhook-discord-forum'
 main = "worker.js"
-compatibility_date = "2026-08-19"
+compatibility_date = "2026-08-18"
 
 # Nothing else is needed here. The link between an email address and this
 # Worker is made in the Cloudflare dashboard, not in this file:
