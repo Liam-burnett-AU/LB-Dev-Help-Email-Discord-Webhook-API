@@ -1,0 +1,11 @@
+name = "email-to-discord-forum"
+main = "worker.js"
+compatibility_date = "2026-08-19"
+
+# Nothing else is needed here. The link between an email address and this
+# Worker is made in the Cloudflare dashboard, not in this file:
+#   Compute > Email Service > Email Routing > Routing Rules
+#   -> Create routing rule -> Action: "Send to a Worker" -> pick this Worker.
+#
+# The webhook URL is a secret, not a variable - set it with:
+#   wrangler secret put DISCORD_WEBHOOK_URL
