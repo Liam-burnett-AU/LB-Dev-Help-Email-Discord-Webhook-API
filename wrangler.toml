@@ -1,4 +1,5 @@
-name = "email-to-discord-forum"
+# wrangler.toml
+name = 'help-lbdev-tech--webhook-discord-forum'
 main = "worker.js"
 compatibility_date = "2026-08-19"
 
