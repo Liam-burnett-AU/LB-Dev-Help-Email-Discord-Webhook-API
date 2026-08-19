@@ -95,10 +95,14 @@ async function postToDiscord(message, env) {
 }
 
 async function forwardCopy(message) {
-  if (!FORWARD_TO_EMAIL) return; // forwarding turned off
+  if (!FORWARD_TO_EMAIL) {
+    console.log('FORWARD_TO_EMAIL is blank - skipping forward, Discord-only');
+    return;
+  }
 
   try {
     await message.forward(FORWARD_TO_EMAIL);
+    console.log(`Forwarded to ${FORWARD_TO_EMAIL}`);
   } catch (err) {
     const reason = err?.message || String(err);
     if (reason.includes('not verified')) {
