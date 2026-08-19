@@ -33,54 +33,84 @@ const MAX_ATTACHMENTS = 10; // Discord's hard cap per message
 // Leave empty to process every address you route to this Worker.
 const ALLOWED_RECIPIENTS = [];
 
+// Also forward a copy of the original email to a real inbox, e.g.
+// 'you@gmail.com'. Leave blank ('') to skip forwarding and only post to
+// Discord. IMPORTANT: this address must be added AND verified first, in
+// Compute > Email Service > Email Routing > Destination Addresses -
+// forwarding to an unverified address throws an error (caught below, but
+// it won't actually forward until that's done).
+const FORWARD_TO_EMAIL = 'liamburnett40@gmail.com';
+
 export default {
   async email(message, env, ctx) {
     if (ALLOWED_RECIPIENTS.length && !ALLOWED_RECIPIENTS.includes(message.to)) {
       return; // not an address we care about - ignore quietly
     }
 
-    if (!env.DISCORD_WEBHOOK_URL) {
-      console.error('Missing DISCORD_WEBHOOK_URL secret - run `wrangler secret put DISCORD_WEBHOOK_URL`');
-      return; // don't bounce the email just because Discord isn't configured yet
-    }
-
-    let parsed;
-    try {
-      parsed = await PostalMime.parse(message.raw);
-    } catch (err) {
-      console.error('Failed to parse incoming email:', err);
-      await postParseFailure(env.DISCORD_WEBHOOK_URL, message, err);
-      return;
-    }
-
-    const subject = (parsed.subject || '(no subject)').replace(/[\r\n]+/g, ' ').trim() || '(no subject)';
-    const from = formatAddress(parsed.from) || message.from;
-    const to = (parsed.to || []).map(formatAddress).filter(Boolean).join(', ') || message.to;
-    const bodyText = (parsed.text && parsed.text.trim()) || htmlToPlainText(parsed.html) || '*(no readable body)*';
-    const date = parsed.date ? new Date(parsed.date) : new Date();
-
-    try {
-      const response = await postToDiscordForum(env.DISCORD_WEBHOOK_URL, {
-        subject,
-        from,
-        to,
-        date,
-        bodyText,
-        attachments: FORWARD_ATTACHMENTS ? parsed.attachments || [] : [],
-      });
-
-      if (!response.ok) {
-        console.error(`Discord webhook returned ${response.status}: ${await response.text()}`);
-      }
-    } catch (err) {
-      console.error('Failed to post to Discord:', err);
-    }
-
-    // We don't call message.forward() or message.setReject() - the email is
-    // simply accepted and mirrored into Discord. Add a forward() call here
-    // if you also want a copy to land in a real inbox.
+    // These two are independent - a problem with one (missing secret,
+    // an unverified destination, a weird malformed email) never stops
+    // the other from still happening.
+    await postToDiscord(message, env);
+    await forwardCopy(message);
   },
 };
+
+async function postToDiscord(message, env) {
+  if (!env.DISCORD_WEBHOOK_URL) {
+    console.error('Missing DISCORD_WEBHOOK_URL secret - run `wrangler secret put DISCORD_WEBHOOK_URL`');
+    return; // don't bounce the email just because Discord isn't configured yet
+  }
+
+  let parsed;
+  try {
+    parsed = await PostalMime.parse(message.raw);
+  } catch (err) {
+    console.error('Failed to parse incoming email:', err);
+    await postParseFailure(env.DISCORD_WEBHOOK_URL, message, err);
+    return;
+  }
+
+  const subject = (parsed.subject || '(no subject)').replace(/[\r\n]+/g, ' ').trim() || '(no subject)';
+  const from = formatAddress(parsed.from) || message.from;
+  const to = (parsed.to || []).map(formatAddress).filter(Boolean).join(', ') || message.to;
+  const bodyText = (parsed.text && parsed.text.trim()) || htmlToPlainText(parsed.html) || '*(no readable body)*';
+  const date = parsed.date ? new Date(parsed.date) : new Date();
+
+  try {
+    const response = await postToDiscordForum(env.DISCORD_WEBHOOK_URL, {
+      subject,
+      from,
+      to,
+      date,
+      bodyText,
+      attachments: FORWARD_ATTACHMENTS ? parsed.attachments || [] : [],
+    });
+
+    if (!response.ok) {
+      console.error(`Discord webhook returned ${response.status}: ${await response.text()}`);
+    }
+  } catch (err) {
+    console.error('Failed to post to Discord:', err);
+  }
+}
+
+async function forwardCopy(message) {
+  if (!FORWARD_TO_EMAIL) return; // forwarding turned off
+
+  try {
+    await message.forward(FORWARD_TO_EMAIL);
+  } catch (err) {
+    const reason = err?.message || String(err);
+    if (reason.includes('not verified')) {
+      console.error(
+        `Can't forward to ${FORWARD_TO_EMAIL} - add and verify it as a Destination Address first: ` +
+          'Compute > Email Service > Email Routing > Destination Addresses.'
+      );
+    } else {
+      console.error('Failed to forward email:', err);
+    }
+  }
+}
 
 // ---------------------------------------------------------------------
 // Discord
