@@ -43,7 +43,7 @@ const FORWARD_ATTACHMENTS = true; // upload small attachments as real Discord fi
 const MAX_ATTACHMENT_BYTES = 8 * 1024 * 1024; // 8MB/file - conservative, safe on any server
 const MAX_ATTACHMENTS = 10; // Discord's hard cap per message
 
-// Only react to specific recipient address(es), e.g. ['notify@lbdev.tech'].
+// Only react to specific recipient address(es), e.g. ['help@lbdev.app'].
 // Leave empty to process every address you route to this Worker.
 const ALLOWED_RECIPIENTS = [];
 
@@ -66,9 +66,9 @@ const MAX_CONTACT_MESSAGE_LENGTH = MAX_DESCRIPTION_LENGTH; // Discord embed desc
 // auto-reply (to whoever submitted the form). It must be on a domain you've
 // enabled Email Routing for (it doesn't need to be a real mailbox), or
 // Cloudflare's send_email binding will reject it.
-const CONTACT_FORM_FROM_EMAIL = 'contact@lbdev.tech';
+const CONTACT_FORM_FROM_EMAIL = 'help@lbdev.app';
 
-// Origins allowed to call the API (CORS), e.g. ['https://lbdev.tech'].
+// Origins allowed to call the API (CORS), e.g. ['https://lbdev.app'].
 // Leave empty to allow any origin.
 const CONTACT_FORM_ALLOWED_ORIGINS = [];
 

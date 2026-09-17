@@ -1,7 +1,14 @@
 # wrangler.toml
-name = 'help-lbdev-tech--webhook-discord-forum'
+name = 'help-lbdev-app--webhook-discord-forum'
 main = "worker.js"
 compatibility_date = "2026-08-18"
+
+# Routes the contact form API. Requires the lbdev.app zone to be active on
+# Cloudflare, and a DNS record for worker.lbdev.app (even a dummy, proxied
+# one - Workers Routes need a matching hostname to attach to).
+[[routes]]
+pattern = "worker.lbdev.app/api/*"
+zone_name = "lbdev.app"
 
 [observability]
 enabled = false
@@ -26,15 +33,21 @@ head_sampling_rate = 1
 name = "SEND_EMAIL"
 
 
-# Nothing else is needed here. The link between an email address and this
-# Worker is made in the Cloudflare dashboard, not in this file:
+# The link between an email address (help@lbdev.app) and this Worker is made
+# in the Cloudflare dashboard, not in this file:
 #   Compute > Email Service > Email Routing > Routing Rules
 #   -> Create routing rule -> Action: "Send to a Worker" -> pick this Worker.
 #
-# The fetch() contact form API is reachable at whatever route/custom domain
-# you attach to this Worker (Cloudflare dashboard -> Workers Routes, or the
-# workers.dev subdomain shown after deploy).
+# The fetch() contact form API is reachable at worker.lbdev.app/api/* (see
+# the [[routes]] block above).
 #
 # Both webhook URLs are secrets, not variables - set them with:
 #   wrangler secret put DISCORD_WEBHOOK_URL
 #   wrangler secret put CONTACT_DISCORD_WEBHOOK_URL
+#
+# NOTE ON THE DOMAIN MOVE: renaming `name` above means Cloudflare treats
+# this as a brand new Worker, not a rename of the old lbdev.tech one. After
+# deploying, re-add the secrets and the send_email destination on this
+# Worker (they don't carry over), point the Email Routing rule at it, and
+# delete the old help-lbdev-tech--webhook-discord-forum Worker once
+# everything's confirmed working on lbdev.app.

@@ -5,7 +5,7 @@ A small [Cloudflare Worker](https://workers.cloudflare.com/) with two independen
 1. **`email()`** — a [Cloudflare Email Worker](https://developers.cloudflare.com/email-routing/email-workers/) that catches email sent to an address on your domain, parses it, and posts it as a new thread in a Discord **forum channel**. Optionally forwards a copy of the original email to a real inbox too.
 2. **`fetch()`** — a small JSON API for a "contact me" form. A `POST` with `{ name, email, subject, message }` posts a thread to a *different* Discord forum channel, and emails you a copy.
 
-Built for `help.lbdev.tech` — email or a web form in, Discord thread out, with a copy landing in a normal inbox if you want one.
+Built for `help@lbdev.app` (email in) and `worker.lbdev.app/api/*` (contact form in) — Discord thread out, with a copy landing in a normal inbox if you want one.
 
 ---
 
@@ -124,10 +124,18 @@ Sending/forwarding to an unverified address throws an error — it's caught so i
 
 ### 8. Hook up the contact form API
 
-Give the Worker a route so your form can reach it — Cloudflare dashboard → **Workers Routes** (e.g. `api.lbdev.tech/*`), or just use the `workers.dev` URL shown after deploy. Then point your form's `fetch()`/`XMLHttpRequest` at it:
+The route is already declared in [`wrangler.toml`](./wrangler.toml):
+
+```toml
+[[routes]]
+pattern = "worker.lbdev.app/api/*"
+zone_name = "lbdev.app"
+```
+
+This requires `lbdev.app` to be an active zone on your Cloudflare account, with a DNS record for the `worker` hostname (even a dummy, proxied one — Workers Routes need a matching hostname to attach to). Once that's in place, `npm run deploy` wires it up automatically — no manual dashboard step needed. Then point your form's `fetch()`/`XMLHttpRequest` at it:
 
 ```js
-await fetch('https://api.lbdev.tech/', {
+await fetch('https://worker.lbdev.app/api/contact', {
   method: 'POST',
   headers: { 'Content-Type': 'application/json' },
   body: JSON.stringify({ name, email, subject, message }),
@@ -138,7 +146,7 @@ await fetch('https://api.lbdev.tech/', {
 
 ## Contact form API
 
-**`POST /`** (any path on the Worker's route works — it's a single endpoint)
+**`POST https://worker.lbdev.app/api/contact`** (any path under `/api/*` works — it's a single endpoint, `/api/*` is just what's routed to this Worker)
 
 Request body (JSON):
 
@@ -182,7 +190,7 @@ All configuration lives at the top of [`worker.js`](./worker.js) — there's no 
 | `MAX_CONTACT_NAME_LENGTH` | `100` | Truncation cap for the contact form's `name` field |
 | `MAX_CONTACT_SUBJECT_LENGTH` | `100` | Truncation cap for the contact form's `subject` (reuses the forum title cap) |
 | `MAX_CONTACT_MESSAGE_LENGTH` | `3900` | Truncation cap for the contact form's `message` (reuses the embed description cap) |
-| `CONTACT_FORM_FROM_EMAIL` | `contact@lbdev.tech` | "From" address on notification + auto-reply emails. Must be on a domain you've enabled Email Routing for |
+| `CONTACT_FORM_FROM_EMAIL` | `help@lbdev.app` | "From" address on notification + auto-reply emails. Must be on a domain you've enabled Email Routing for |
 | `CONTACT_FORM_ALLOWED_ORIGINS` | `[]` | Origins allowed to call the API (CORS). Leave empty to allow any origin |
 | `AUTO_REPLY_ENABLED` | `true` | Whether to email the form submitter a "message received" confirmation |
 | `AUTO_REPLY_FROM_NAME` | `LB Dev` | Display name the auto-reply is sent from, and its sign-off |
@@ -202,7 +210,7 @@ npm run dev
 Runs the Worker locally via `wrangler dev`. Email Workers can't easily be triggered with a real inbound email locally — for quick iteration on the `email()` flow, it's usually faster to tweak logic, deploy, and send a real test email. The contact form API is a normal HTTP endpoint, so it works fine against `wrangler dev`:
 
 ```bash
-curl -X POST http://localhost:8787/ \
+curl -X POST http://localhost:8787/api/contact \
   -H 'Content-Type: application/json' \
   -d '{"name":"Test","email":"test@example.com","subject":"hi","message":"testing locally"}'
 ```
