@@ -1,22 +1,36 @@
 /**
  * =========================================================================
- *  Email -> Discord Forum Post   (Cloudflare Email Worker)
+ *  Email -> Discord Forum Post   (Cloudflare Email Worker + Contact API)
  * =========================================================================
- *  Cloudflare Email Routing calls email() below whenever mail arrives at
- *  an address you've pointed at this Worker. It parses the message with
- *  postal-mime, then creates a new post (thread) in a Discord forum
- *  channel via that channel's webhook.
+ *  Two independent entry points into the same Worker:
+ *
+ *  1. email() - Cloudflare Email Routing calls this whenever mail arrives
+ *     at an address you've pointed at this Worker. It parses the message
+ *     with postal-mime, then creates a new post (thread) in a Discord
+ *     forum channel via that channel's webhook.
+ *
+ *  2. fetch() - a small JSON API for a "contact me" form. A POST with
+ *     { name, email, subject, message } creates a thread in a *different*
+ *     Discord forum channel and emails you a copy, using Cloudflare's
+ *     native send_email binding.
  *
  *  Full setup walkthrough is in README.md. Quick version:
- *    1. Create a webhook ON the target Discord forum channel.
- *    2. wrangler secret put DISCORD_WEBHOOK_URL
- *    3. wrangler deploy
- *    4. Cloudflare dashboard -> Compute > Email Service > Email Routing >
- *       Routing Rules -> Create routing rule -> Action: Send to a Worker.
+ *    Email -> Discord:
+ *      1. Create a webhook ON the target Discord forum channel.
+ *      2. wrangler secret put DISCORD_WEBHOOK_URL
+ *      3. Cloudflare dashboard -> Compute > Email Service > Email Routing >
+ *         Routing Rules -> Create routing rule -> Action: Send to a Worker.
+ *    Contact form API:
+ *      1. Create a webhook ON a (probably different) Discord forum channel.
+ *      2. wrangler secret put CONTACT_DISCORD_WEBHOOK_URL
+ *      3. Add a [[send_email]] binding in wrangler.toml (see comments there).
+ *    Then: wrangler deploy
  * =========================================================================
  */
 
 import PostalMime from 'postal-mime';
+import { createMimeMessage } from 'mimetext';
+import { EmailMessage } from 'cloudflare:email';
 
 // ---------------------------------------------------------------------
 // Configuration - tweak these to taste
@@ -41,6 +55,24 @@ const ALLOWED_RECIPIENTS = [];
 // it won't actually forward until that's done).
 const FORWARD_TO_EMAIL = 'liamburnett40@gmail.com';
 
+// ---------------------------------------------------------------------
+// Contact form API config
+// ---------------------------------------------------------------------
+const MAX_CONTACT_NAME_LENGTH = 100;
+const MAX_CONTACT_SUBJECT_LENGTH = MAX_THREAD_NAME_LENGTH; // Discord forum post title hard cap
+const MAX_CONTACT_MESSAGE_LENGTH = MAX_DESCRIPTION_LENGTH; // Discord embed description hard cap
+
+// The "From" address used when emailing you a copy of a submission. It must
+// be on a domain you've enabled Email Routing for (it doesn't need to be a
+// real mailbox), or Cloudflare's send_email binding will reject it.
+const CONTACT_FORM_FROM_EMAIL = 'contact@lbdev.tech';
+
+// Origins allowed to call the API (CORS), e.g. ['https://lbdev.tech'].
+// Leave empty to allow any origin.
+const CONTACT_FORM_ALLOWED_ORIGINS = [];
+
+const EMAIL_ADDRESS_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
 export default {
   async email(message, env, ctx) {
     if (ALLOWED_RECIPIENTS.length && !ALLOWED_RECIPIENTS.includes(message.to)) {
@@ -52,6 +84,10 @@ export default {
     // the other from still happening.
     await postToDiscord(message, env);
     await forwardCopy(message);
+  },
+
+  async fetch(request, env, ctx) {
+    return handleContactForm(request, env);
   },
 };
 
@@ -114,6 +150,130 @@ async function forwardCopy(message) {
       console.error('Failed to forward email:', err);
     }
   }
+}
+
+// ---------------------------------------------------------------------
+// Contact form API
+// ---------------------------------------------------------------------
+
+async function handleContactForm(request, env) {
+  const corsHeaders = buildCorsHeaders(request);
+
+  if (request.method === 'OPTIONS') {
+    return new Response(null, { status: 204, headers: corsHeaders });
+  }
+
+  if (request.method !== 'POST') {
+    return jsonResponse({ error: 'Method not allowed' }, 405, corsHeaders);
+  }
+
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return jsonResponse({ error: 'Invalid JSON body' }, 400, corsHeaders);
+  }
+
+  const name = typeof body.name === 'string' ? body.name.trim() : '';
+  const email = typeof body.email === 'string' ? body.email.trim() : '';
+  const subject = (typeof body.subject === 'string' ? body.subject.trim() : '') || '(no subject)';
+  const message = typeof body.message === 'string' ? body.message.trim() : '';
+
+  if (!name || !email || !message) {
+    return jsonResponse({ error: 'name, email and message are required' }, 400, corsHeaders);
+  }
+  if (!EMAIL_ADDRESS_PATTERN.test(email)) {
+    return jsonResponse({ error: 'Invalid email address' }, 400, corsHeaders);
+  }
+
+  const fields = {
+    name: truncate(name, MAX_CONTACT_NAME_LENGTH),
+    email: truncate(email, MAX_FIELD_LENGTH),
+    subject: truncate(subject, MAX_CONTACT_SUBJECT_LENGTH),
+    message: truncate(message, MAX_CONTACT_MESSAGE_LENGTH),
+  };
+
+  // Same philosophy as the email handler - a problem with one (missing
+  // secret/binding, Discord being down) never stops the other.
+  const [discordResult, emailResult] = await Promise.allSettled([
+    postContactToDiscord(env, fields),
+    sendContactNotification(env, fields),
+  ]);
+
+  if (discordResult.status === 'rejected') {
+    console.error('Contact form Discord post failed:', discordResult.reason);
+  }
+  if (emailResult.status === 'rejected') {
+    console.error('Contact form email notification failed:', emailResult.reason);
+  }
+
+  if (discordResult.status === 'rejected' && emailResult.status === 'rejected') {
+    return jsonResponse({ error: 'Failed to deliver message' }, 502, corsHeaders);
+  }
+
+  return jsonResponse({ ok: true }, 200, corsHeaders);
+}
+
+function buildCorsHeaders(request) {
+  const origin = request.headers.get('Origin') || '*';
+  const allowed = CONTACT_FORM_ALLOWED_ORIGINS.length === 0 || CONTACT_FORM_ALLOWED_ORIGINS.includes(origin);
+  return {
+    'Access-Control-Allow-Origin': allowed ? origin : 'null',
+    'Access-Control-Allow-Methods': 'POST, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type',
+    'Content-Type': 'application/json',
+  };
+}
+
+function jsonResponse(data, status, headers) {
+  return new Response(JSON.stringify(data), { status, headers });
+}
+
+async function postContactToDiscord(env, { name, email, subject, message }) {
+  if (!env.CONTACT_DISCORD_WEBHOOK_URL) {
+    throw new Error('Missing CONTACT_DISCORD_WEBHOOK_URL secret - run `wrangler secret put CONTACT_DISCORD_WEBHOOK_URL`');
+  }
+
+  const embed = {
+    title: subject,
+    description: message,
+    color: EMBED_COLOR,
+    fields: [
+      { name: 'Name', value: name, inline: true },
+      { name: 'Email', value: email, inline: true },
+    ],
+    timestamp: new Date().toISOString(),
+    footer: { text: 'via contact form API' },
+  };
+
+  const response = await fetch(env.CONTACT_DISCORD_WEBHOOK_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ thread_name: subject, embeds: [embed] }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`Discord webhook returned ${response.status}: ${await response.text()}`);
+  }
+}
+
+async function sendContactNotification(env, { name, email, subject, message }) {
+  if (!env.SEND_EMAIL) {
+    throw new Error('Missing SEND_EMAIL binding - add a [[send_email]] block to wrangler.toml and redeploy');
+  }
+  if (!FORWARD_TO_EMAIL) {
+    return; // no notify address configured - Discord-only
+  }
+
+  const mime = createMimeMessage();
+  mime.setSender({ name: 'LB Dev Contact Form', addr: CONTACT_FORM_FROM_EMAIL });
+  mime.setRecipient(FORWARD_TO_EMAIL);
+  mime.setSubject(`[Contact Form] ${subject}`);
+  mime.setHeader('Reply-To', email);
+  mime.addMessage({ contentType: 'text/plain', data: `From: ${name} <${email}>\n\n${message}` });
+
+  const mail = new EmailMessage(CONTACT_FORM_FROM_EMAIL, FORWARD_TO_EMAIL, mime.asRaw());
+  await env.SEND_EMAIL.send(mail);
 }
 
 // ---------------------------------------------------------------------
