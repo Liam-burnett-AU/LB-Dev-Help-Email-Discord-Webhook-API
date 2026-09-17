@@ -1,5 +1,5 @@
 # wrangler.toml
-name = 'LB-Dev-Help-Email-Discord-Webhook-API'
+name = 'lb-dev-help-email-discord-webhook-api'
 main = "worker.js"
 compatibility_date = "2026-08-18"
 
