@@ -45,15 +45,16 @@ Your website's contact form
       ▼
 this Worker's fetch() handler
       │
-      ┌───────────────┴───────────────┐
-      ▼                                ▼
-postContactToDiscord()          sendContactNotification()
-(POST to a SEPARATE            (build a MIME message,
- Discord forum webhook)         send via the send_email
-                                 binding to FORWARD_TO_EMAIL)
+      ┌───────────────┼───────────────────────┐
+      ▼                ▼                       ▼
+postContactToDiscord() sendContactNotification() sendAutoReply()
+(POST to a SEPARATE   (build a MIME message,     (build a MIME message,
+ Discord forum         send via send_email        send via send_email
+ webhook)              to FORWARD_TO_EMAIL)       to the submitter's
+                                                   own email address)
 ```
 
-Same independence guarantee as the email flow — a Discord outage doesn't stop the email notification, and vice versa. The API responds `502` only if **both** fail.
+Same independence guarantee as the email flow — a Discord outage doesn't stop the notification email, and vice versa. The auto-reply is a courtesy on top and never affects the response status. The API responds `502` only if **both** the Discord post and your notification email fail.
 
 ---
 
@@ -90,7 +91,7 @@ wrangler secret put CONTACT_DISCORD_WEBHOOK_URL   # contact form → Discord
 
 Paste the relevant webhook URL when prompted for each.
 
-### 4. Add the send_email binding (needed for the contact form's email notification)
+### 4. Add the send_email binding (needed for the contact form's email notification + auto-reply)
 
 Already present in [`wrangler.toml`](./wrangler.toml):
 
@@ -100,6 +101,8 @@ name = "SEND_EMAIL"
 ```
 
 This lets the Worker send email natively — no third-party email API or key needed.
+
+> **Leave this binding unrestricted** — don't add `destination_address` or `allowed_destination_addresses` to it. The notification email only ever goes to your fixed `FORWARD_TO_EMAIL`, but the auto-reply goes to whatever email address each visitor typed into the form, so the binding needs to be able to send to arbitrary addresses.
 
 ### 5. Deploy the Worker
 
@@ -179,8 +182,12 @@ All configuration lives at the top of [`worker.js`](./worker.js) — there's no 
 | `MAX_CONTACT_NAME_LENGTH` | `100` | Truncation cap for the contact form's `name` field |
 | `MAX_CONTACT_SUBJECT_LENGTH` | `100` | Truncation cap for the contact form's `subject` (reuses the forum title cap) |
 | `MAX_CONTACT_MESSAGE_LENGTH` | `3900` | Truncation cap for the contact form's `message` (reuses the embed description cap) |
-| `CONTACT_FORM_FROM_EMAIL` | `contact@lbdev.tech` | "From" address on notification emails. Must be on a domain you've enabled Email Routing for |
+| `CONTACT_FORM_FROM_EMAIL` | `contact@lbdev.tech` | "From" address on notification + auto-reply emails. Must be on a domain you've enabled Email Routing for |
 | `CONTACT_FORM_ALLOWED_ORIGINS` | `[]` | Origins allowed to call the API (CORS). Leave empty to allow any origin |
+| `AUTO_REPLY_ENABLED` | `true` | Whether to email the form submitter a "message received" confirmation |
+| `AUTO_REPLY_FROM_NAME` | `LB Dev` | Display name the auto-reply is sent from, and its sign-off |
+| `AUTO_REPLY_SUBJECT` | `Thanks for reaching out - message received` | Subject line of the auto-reply |
+| `AUTO_REPLY_TURNAROUND` | `2-3 business days` | Turnaround time quoted in the auto-reply body |
 
 Edit these directly in `worker.js` and redeploy (`npm run deploy`) to apply changes.
 
@@ -217,6 +224,7 @@ npm run tail
 - **Contact form returns 502** — both delivery attempts failed; check `wrangler tail` for the two logged errors (one from `postContactToDiscord`, one from `sendContactNotification`).
 - **Contact form email never arrives, but Discord post works** — check for `Missing SEND_EMAIL binding` (add `[[send_email]]` to `wrangler.toml` and redeploy) or a rejected "From" address (`CONTACT_FORM_FROM_EMAIL` must be on a domain you've enabled Email Routing for) or an unverified `FORWARD_TO_EMAIL` destination.
 - **Contact form request blocked by CORS in the browser** — add your site's origin to `CONTACT_FORM_ALLOWED_ORIGINS`, or leave it empty to allow any origin.
+- **Auto-reply never arrives** — check `wrangler tail` for `Contact form auto-reply failed`. If the binding has `destination_address`/`allowed_destination_addresses` set in `wrangler.toml`, remove it — the auto-reply needs to send to arbitrary visitor addresses. Set `AUTO_REPLY_ENABLED = false` to turn it off entirely.
 
 ---
 

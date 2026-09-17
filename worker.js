@@ -62,14 +62,26 @@ const MAX_CONTACT_NAME_LENGTH = 100;
 const MAX_CONTACT_SUBJECT_LENGTH = MAX_THREAD_NAME_LENGTH; // Discord forum post title hard cap
 const MAX_CONTACT_MESSAGE_LENGTH = MAX_DESCRIPTION_LENGTH; // Discord embed description hard cap
 
-// The "From" address used when emailing you a copy of a submission. It must
-// be on a domain you've enabled Email Routing for (it doesn't need to be a
-// real mailbox), or Cloudflare's send_email binding will reject it.
+// The "From" address used for both the notification email (to you) and the
+// auto-reply (to whoever submitted the form). It must be on a domain you've
+// enabled Email Routing for (it doesn't need to be a real mailbox), or
+// Cloudflare's send_email binding will reject it.
 const CONTACT_FORM_FROM_EMAIL = 'contact@lbdev.tech';
 
 // Origins allowed to call the API (CORS), e.g. ['https://lbdev.tech'].
 // Leave empty to allow any origin.
 const CONTACT_FORM_ALLOWED_ORIGINS = [];
+
+// Send a "thanks, we got it" confirmation email back to whoever submitted
+// the form. Set to false to skip this and only notify/post internally.
+// NOTE: this sends to an arbitrary address the visitor typed in, so the
+// [[send_email]] binding in wrangler.toml must stay unrestricted (no
+// destination_address / allowed_destination_addresses) - restricting it
+// would silently break this.
+const AUTO_REPLY_ENABLED = true;
+const AUTO_REPLY_FROM_NAME = 'LB Dev';
+const AUTO_REPLY_SUBJECT = 'Thanks for reaching out - message received';
+const AUTO_REPLY_TURNAROUND = '2-3 business days';
 
 const EMAIL_ADDRESS_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
@@ -194,10 +206,13 @@ async function handleContactForm(request, env) {
   };
 
   // Same philosophy as the email handler - a problem with one (missing
-  // secret/binding, Discord being down) never stops the other.
-  const [discordResult, emailResult] = await Promise.allSettled([
+  // secret/binding, Discord being down) never stops the others. The
+  // auto-reply is a courtesy to the sender, not core delivery, so it's
+  // excluded from the pass/fail check below.
+  const [discordResult, emailResult, autoReplyResult] = await Promise.allSettled([
     postContactToDiscord(env, fields),
     sendContactNotification(env, fields),
+    AUTO_REPLY_ENABLED ? sendAutoReply(env, fields) : Promise.resolve(),
   ]);
 
   if (discordResult.status === 'rejected') {
@@ -205,6 +220,9 @@ async function handleContactForm(request, env) {
   }
   if (emailResult.status === 'rejected') {
     console.error('Contact form email notification failed:', emailResult.reason);
+  }
+  if (autoReplyResult.status === 'rejected') {
+    console.error('Contact form auto-reply failed:', autoReplyResult.reason);
   }
 
   if (discordResult.status === 'rejected' && emailResult.status === 'rejected') {
@@ -273,6 +291,28 @@ async function sendContactNotification(env, { name, email, subject, message }) {
   mime.addMessage({ contentType: 'text/plain', data: `From: ${name} <${email}>\n\n${message}` });
 
   const mail = new EmailMessage(CONTACT_FORM_FROM_EMAIL, FORWARD_TO_EMAIL, mime.asRaw());
+  await env.SEND_EMAIL.send(mail);
+}
+
+async function sendAutoReply(env, { name, email, subject }) {
+  if (!env.SEND_EMAIL) {
+    throw new Error('Missing SEND_EMAIL binding - add a [[send_email]] block to wrangler.toml and redeploy');
+  }
+
+  const mime = createMimeMessage();
+  mime.setSender({ name: AUTO_REPLY_FROM_NAME, addr: CONTACT_FORM_FROM_EMAIL });
+  mime.setRecipient(email);
+  mime.setSubject(AUTO_REPLY_SUBJECT);
+  mime.addMessage({
+    contentType: 'text/plain',
+    data:
+      `Hi ${name},\n\n` +
+      `Thanks for reaching out${subject && subject !== '(no subject)' ? ` about "${subject}"` : ''} - ` +
+      `this is just to confirm your message came through. I'll get back to you within ${AUTO_REPLY_TURNAROUND}.\n\n` +
+      `Cheers,\n${AUTO_REPLY_FROM_NAME}`,
+  });
+
+  const mail = new EmailMessage(CONTACT_FORM_FROM_EMAIL, email, mime.asRaw());
   await env.SEND_EMAIL.send(mail);
 }
 
