@@ -9,7 +9,8 @@
     "tail": "wrangler tail"
   },
   "dependencies": {
-    "postal-mime": "^3.0.0"
+    "postal-mime": "^3.0.0",
+    "mimetext": "^3.0.0"
   },
   "devDependencies": {
     "wrangler": "^4.0.0"

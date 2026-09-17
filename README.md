@@ -1,12 +1,17 @@
-# Email → Discord Forum (Cloudflare Email Worker)
+# Email → Discord Forum (Cloudflare Email Worker + Contact Form API)
 
-A small [Cloudflare Email Worker](https://developers.cloudflare.com/email-routing/email-workers/) that catches email sent to an address on your domain, parses it, and posts it as a new thread in a Discord **forum channel** via that channel's webhook. Optionally forwards a copy of the original email to a real inbox at the same time.
+A small [Cloudflare Worker](https://workers.cloudflare.com/) with two independent entry points into the same script:
 
-Built for `help.lbdev.tech` — email in, Discord thread out, with a copy landing in a normal inbox if you want one.
+1. **`email()`** — a [Cloudflare Email Worker](https://developers.cloudflare.com/email-routing/email-workers/) that catches email sent to an address on your domain, parses it, and posts it as a new thread in a Discord **forum channel**. Optionally forwards a copy of the original email to a real inbox too.
+2. **`fetch()`** — a small JSON API for a "contact me" form. A `POST` with `{ name, email, subject, message }` posts a thread to a *different* Discord forum channel, and emails you a copy.
+
+Built for `help.lbdev.tech` — email or a web form in, Discord thread out, with a copy landing in a normal inbox if you want one.
 
 ---
 
 ## How it works
+
+### Email → Discord
 
 ```
 Incoming email
@@ -32,12 +37,30 @@ The two actions are independent — if Discord is unreachable or misconfigured, 
 5. Creates a new forum thread named after the subject line.
 6. Forwards a copy of the original email to a real inbox, if configured.
 
+### Contact form → Discord + email
+
+```
+Your website's contact form
+      │  POST { name, email, subject, message }
+      ▼
+this Worker's fetch() handler
+      │
+      ┌───────────────┴───────────────┐
+      ▼                                ▼
+postContactToDiscord()          sendContactNotification()
+(POST to a SEPARATE            (build a MIME message,
+ Discord forum webhook)         send via the send_email
+                                 binding to FORWARD_TO_EMAIL)
+```
+
+Same independence guarantee as the email flow — a Discord outage doesn't stop the email notification, and vice versa. The API responds `502` only if **both** fail.
+
 ---
 
 ## Requirements
 
 - A domain on Cloudflare with [Email Routing](https://developers.cloudflare.com/email-routing/) enabled.
-- A Discord server with a **forum channel** (this only works with forum channels — the webhook needs `thread_name` support).
+- A Discord server with **forum channels** (this only works with forum channels — the webhook needs `thread_name` support). You can use the same forum for both flows, or two different ones.
 - [Node.js](https://nodejs.org/) and [Wrangler](https://developers.cloudflare.com/workers/wrangler/) (installed as a dev dependency below).
 
 ---
@@ -50,39 +73,91 @@ The two actions are independent — if Discord is unreachable or misconfigured, 
 npm install
 ```
 
-### 2. Create a Discord webhook on the target forum channel
+### 2. Create the Discord webhook(s)
 
-In Discord: **Channel Settings → Integrations → Webhooks → New Webhook**, then copy the webhook URL.
+In Discord, on **each** forum channel you want posts to land in: **Channel Settings → Integrations → Webhooks → New Webhook**, then copy the webhook URL. You need one for email-in and, if you want it separate, another one for the contact form.
 
 > The webhook must be created *on the forum channel itself* — a webhook from a regular text channel won't support forum posts.
 
-### 3. Set the webhook URL as a secret
+### 3. Set the webhook URLs as secrets
 
-Never commit the webhook URL — it's a secret, not a variable, and isn't stored in `wrangler.toml`.
+Never commit webhook URLs — they're secrets, not variables, and aren't stored in `wrangler.toml`.
 
 ```bash
-wrangler secret put DISCORD_WEBHOOK_URL
+wrangler secret put DISCORD_WEBHOOK_URL           # email → Discord
+wrangler secret put CONTACT_DISCORD_WEBHOOK_URL   # contact form → Discord
 ```
 
-Paste the webhook URL when prompted.
+Paste the relevant webhook URL when prompted for each.
 
-### 4. Deploy the Worker
+### 4. Add the send_email binding (needed for the contact form's email notification)
+
+Already present in [`wrangler.toml`](./wrangler.toml):
+
+```toml
+[[send_email]]
+name = "SEND_EMAIL"
+```
+
+This lets the Worker send email natively — no third-party email API or key needed.
+
+### 5. Deploy the Worker
 
 ```bash
 npm run deploy
 ```
 
-### 5. Point an email address at the Worker
+### 6. Point an email address at the Worker (for the email → Discord flow)
 
 Cloudflare dashboard → **Compute → Email Service → Email Routing → Routing Rules → Create routing rule**, then set the action to **Send to a Worker** and pick this Worker.
 
-### 6. (Optional) Verify a forward-to address
+### 7. Verify the notify/forward-to address
 
-If you want a copy of every email to also land in a real inbox, that address must be added **and verified** first:
+`FORWARD_TO_EMAIL` in `worker.js` is used both to forward a copy of incoming emails **and** to email you contact-form submissions. Either way, it must be added **and verified** first:
 
 **Compute → Email Service → Email Routing → Destination Addresses**
 
-Forwarding to an unverified address throws an error — it's caught so it won't break anything, but the copy won't actually arrive until the address is verified.
+Sending/forwarding to an unverified address throws an error — it's caught so it won't break anything, but nothing will actually arrive until the address is verified.
+
+### 8. Hook up the contact form API
+
+Give the Worker a route so your form can reach it — Cloudflare dashboard → **Workers Routes** (e.g. `api.lbdev.tech/*`), or just use the `workers.dev` URL shown after deploy. Then point your form's `fetch()`/`XMLHttpRequest` at it:
+
+```js
+await fetch('https://api.lbdev.tech/', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ name, email, subject, message }),
+});
+```
+
+---
+
+## Contact form API
+
+**`POST /`** (any path on the Worker's route works — it's a single endpoint)
+
+Request body (JSON):
+
+```json
+{
+  "name": "Ada Lovelace",
+  "email": "ada@example.com",
+  "subject": "project / collab / just saying hi",
+  "message": "what's up?"
+}
+```
+
+`name`, `email` and `message` are required; `subject` defaults to `(no subject)` if left blank. Responses:
+
+| Status | Meaning |
+|---|---|
+| `200 { "ok": true }` | Delivered to Discord and/or email |
+| `400 { "error": "..." }` | Missing/invalid field |
+| `405 { "error": "Method not allowed" }` | Anything other than `POST`/`OPTIONS` |
+| `502 { "error": "Failed to deliver message" }` | Both the Discord post and the email notification failed |
+
+CORS is handled automatically (including `OPTIONS` preflight) based on `CONTACT_FORM_ALLOWED_ORIGINS` below.
 
 ---
 
@@ -100,7 +175,12 @@ All configuration lives at the top of [`worker.js`](./worker.js) — there's no 
 | `MAX_ATTACHMENT_BYTES` | `8 * 1024 * 1024` (8 MB) | Per-file size cap for attachments forwarded to Discord |
 | `MAX_ATTACHMENTS` | `10` | Max number of attachments per message (Discord's hard cap) |
 | `ALLOWED_RECIPIENTS` | `[]` | Restrict processing to specific `To:` addresses. Leave empty to process every address routed to this Worker |
-| `FORWARD_TO_EMAIL` | `liamburnett40@gmail.com` | Where to forward a copy of the original email. Leave as `''` to skip forwarding and post to Discord only |
+| `FORWARD_TO_EMAIL` | `liamburnett40@gmail.com` | Where to forward a copy of incoming email, and where contact-form notifications are sent. Leave as `''` to skip both and only post to Discord |
+| `MAX_CONTACT_NAME_LENGTH` | `100` | Truncation cap for the contact form's `name` field |
+| `MAX_CONTACT_SUBJECT_LENGTH` | `100` | Truncation cap for the contact form's `subject` (reuses the forum title cap) |
+| `MAX_CONTACT_MESSAGE_LENGTH` | `3900` | Truncation cap for the contact form's `message` (reuses the embed description cap) |
+| `CONTACT_FORM_FROM_EMAIL` | `contact@lbdev.tech` | "From" address on notification emails. Must be on a domain you've enabled Email Routing for |
+| `CONTACT_FORM_ALLOWED_ORIGINS` | `[]` | Origins allowed to call the API (CORS). Leave empty to allow any origin |
 
 Edit these directly in `worker.js` and redeploy (`npm run deploy`) to apply changes.
 
@@ -112,7 +192,13 @@ Edit these directly in `worker.js` and redeploy (`npm run deploy`) to apply chan
 npm run dev
 ```
 
-Runs the Worker locally via `wrangler dev`. Email Workers can't easily be triggered with a real inbound email locally — for quick iteration, it's usually faster to tweak logic, deploy, and send a real test email.
+Runs the Worker locally via `wrangler dev`. Email Workers can't easily be triggered with a real inbound email locally — for quick iteration on the `email()` flow, it's usually faster to tweak logic, deploy, and send a real test email. The contact form API is a normal HTTP endpoint, so it works fine against `wrangler dev`:
+
+```bash
+curl -X POST http://localhost:8787/ \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"Test","email":"test@example.com","subject":"hi","message":"testing locally"}'
+```
 
 To watch live logs from the deployed Worker:
 
@@ -128,12 +214,16 @@ npm run tail
 - **Forward copy never arrives** — the destination address almost certainly isn't verified yet. Check logs for `not verified` and confirm it under Email Routing → Destination Addresses.
 - **Email parse errors** — a malformed message still posts a fallback thread to Discord noting the parse failure, so you'll see it rather than silently losing the email.
 - **Discord webhook 4xx/5xx** — logged via `console.error`, visible in `wrangler tail`. A 404 usually means the webhook was deleted or regenerated; recreate it and update the secret.
+- **Contact form returns 502** — both delivery attempts failed; check `wrangler tail` for the two logged errors (one from `postContactToDiscord`, one from `sendContactNotification`).
+- **Contact form email never arrives, but Discord post works** — check for `Missing SEND_EMAIL binding` (add `[[send_email]]` to `wrangler.toml` and redeploy) or a rejected "From" address (`CONTACT_FORM_FROM_EMAIL` must be on a domain you've enabled Email Routing for) or an unverified `FORWARD_TO_EMAIL` destination.
+- **Contact form request blocked by CORS in the browser** — add your site's origin to `CONTACT_FORM_ALLOWED_ORIGINS`, or leave it empty to allow any origin.
 
 ---
 
 ## Tech stack
 
-- [Cloudflare Workers](https://workers.cloudflare.com/) + [Email Routing](https://developers.cloudflare.com/email-routing/)
+- [Cloudflare Workers](https://workers.cloudflare.com/) + [Email Routing](https://developers.cloudflare.com/email-routing/) (inbound email, outbound `send_email` binding)
 - [`postal-mime`](https://www.npmjs.com/package/postal-mime) for MIME parsing
+- [`mimetext`](https://www.npmjs.com/package/mimetext) for building outbound notification emails
 - [Discord webhooks](https://discord.com/developers/docs/resources/webhook) (forum-thread creation via `thread_name`)
 - [Wrangler](https://developers.cloudflare.com/workers/wrangler/) for local dev / deploy

@@ -18,11 +18,23 @@ enabled = false
 persist = true
 head_sampling_rate = 1
 
+# Lets the Worker send emails (fetch() contact form -> notify email) via
+# Cloudflare's native email sending, no third-party API key needed.
+# The destination address used in worker.js (FORWARD_TO_EMAIL) must still be
+# added and verified under Email Routing > Destination Addresses.
+[[send_email]]
+name = "SEND_EMAIL"
+
 
 # Nothing else is needed here. The link between an email address and this
 # Worker is made in the Cloudflare dashboard, not in this file:
 #   Compute > Email Service > Email Routing > Routing Rules
 #   -> Create routing rule -> Action: "Send to a Worker" -> pick this Worker.
 #
-# The webhook URL is a secret, not a variable - set it with:
+# The fetch() contact form API is reachable at whatever route/custom domain
+# you attach to this Worker (Cloudflare dashboard -> Workers Routes, or the
+# workers.dev subdomain shown after deploy).
+#
+# Both webhook URLs are secrets, not variables - set them with:
 #   wrangler secret put DISCORD_WEBHOOK_URL
+#   wrangler secret put CONTACT_DISCORD_WEBHOOK_URL
