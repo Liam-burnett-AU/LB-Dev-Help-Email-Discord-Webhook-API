@@ -1,6 +1,6 @@
 /**
  * =========================================================================
- *  Email -> Discord Forum Post   (Cloudflare Email Worker + Contact API)
+ *  Email -> Discord Forum Post   (Cloudflare Email Worker + HTTP APIs)
  * =========================================================================
  *  Two independent entry points into the same Worker:
  *
@@ -9,10 +9,14 @@
  *     with postal-mime, then creates a new post (thread) in a Discord
  *     forum channel via that channel's webhook.
  *
- *  2. fetch() - a small JSON API for a "contact me" form. A POST with
- *     { name, email, subject, message } creates a thread in a *different*
- *     Discord forum channel and emails you a copy, using Cloudflare's
- *     native send_email binding.
+ *  2. fetch() - routes two JSON APIs by path:
+ *       POST /api/contact - a "contact me" form endpoint. Takes
+ *         { name, email, subject, message }, creates a thread in a
+ *         *different* Discord forum channel, emails you a copy (via the
+ *         send_email binding) and auto-replies to the sender.
+ *       POST /api/send - a generic "send an email" endpoint any of your
+ *         other apps can call (with an API key) to send a real email
+ *         through Gmail's SMTP server, using raw TCP sockets + STARTTLS.
  *
  *  Full setup walkthrough is in README.md. Quick version:
  *    Email -> Discord:
@@ -20,10 +24,18 @@
  *      2. wrangler secret put DISCORD_WEBHOOK_URL
  *      3. Cloudflare dashboard -> Compute > Email Service > Email Routing >
  *         Routing Rules -> Create routing rule -> Action: Send to a Worker.
- *    Contact form API:
+ *    Contact form API (/api/contact):
  *      1. Create a webhook ON a (probably different) Discord forum channel.
  *      2. wrangler secret put CONTACT_DISCORD_WEBHOOK_URL
  *      3. Add a [[send_email]] binding in wrangler.toml (see comments there).
+ *    Send email API (/api/send):
+ *      1. Enable 2-Step Verification on the Gmail account, then create an
+ *         App Password at myaccount.google.com/apppasswords.
+ *      2. wrangler secret put GMAIL_SMTP_USER
+ *      3. wrangler secret put GMAIL_SMTP_APP_PASSWORD
+ *      4. wrangler secret put SEND_EMAIL_API_KEY   (a random shared secret -
+ *         every caller must send it; NEVER call this from browser JS, the
+ *         key would leak. Backend-to-backend only.)
  *    Then: wrangler deploy
  * =========================================================================
  */
@@ -31,6 +43,7 @@
 import PostalMime from 'postal-mime';
 import { createMimeMessage } from 'mimetext';
 import { EmailMessage } from 'cloudflare:email';
+import { connect } from 'cloudflare:sockets';
 
 // ---------------------------------------------------------------------
 // Configuration - tweak these to taste
@@ -85,6 +98,22 @@ const AUTO_REPLY_TURNAROUND = '2-3 business days';
 
 const EMAIL_ADDRESS_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
+// Strips CR/LF so a caller-supplied string can't smuggle extra headers
+// (e.g. a fake "Bcc:") into an outgoing MIME message.
+function sanitizeHeaderValue(str) {
+  return str.replace(/[\r\n]+/g, ' ');
+}
+
+// ---------------------------------------------------------------------
+// Send email API config (Gmail SMTP relay)
+// ---------------------------------------------------------------------
+const GMAIL_SMTP_HOST = 'smtp.gmail.com';
+const GMAIL_SMTP_PORT = 587; // STARTTLS, not implicit TLS (465)
+const SMTP_EHLO_DOMAIN = 'lbdev.app'; // identifies this client in the EHLO greeting - doesn't need to resolve
+const MAX_SEND_EMAIL_RECIPIENTS = 10;
+const MAX_SEND_EMAIL_SUBJECT_LENGTH = 256;
+const MAX_SEND_EMAIL_BODY_LENGTH = 100_000;
+
 export default {
   async email(message, env, ctx) {
     if (ALLOWED_RECIPIENTS.length && !ALLOWED_RECIPIENTS.includes(message.to)) {
@@ -99,7 +128,18 @@ export default {
   },
 
   async fetch(request, env, ctx) {
-    return handleContactForm(request, env);
+    const { pathname } = new URL(request.url);
+
+    if (pathname === '/api/contact' || pathname === '/api/contact/') {
+      return handleContactForm(request, env);
+    }
+    if (pathname === '/api/send' || pathname === '/api/send/') {
+      return handleSendEmail(request, env);
+    }
+    if (request.method === 'OPTIONS') {
+      return new Response(null, { status: 204, headers: buildCorsHeaders(request) });
+    }
+    return jsonResponse({ error: 'Not found' }, 404, buildCorsHeaders(request));
   },
 };
 
@@ -188,7 +228,7 @@ async function handleContactForm(request, env) {
 
   const name = typeof body.name === 'string' ? body.name.trim() : '';
   const email = typeof body.email === 'string' ? body.email.trim() : '';
-  const subject = (typeof body.subject === 'string' ? body.subject.trim() : '') || '(no subject)';
+  const subject = (typeof body.subject === 'string' ? sanitizeHeaderValue(body.subject).trim() : '') || '(no subject)';
   const message = typeof body.message === 'string' ? body.message.trim() : '';
 
   if (!name || !email || !message) {
@@ -314,6 +354,225 @@ async function sendAutoReply(env, { name, email, subject }) {
 
   const mail = new EmailMessage(CONTACT_FORM_FROM_EMAIL, email, mime.asRaw());
   await env.SEND_EMAIL.send(mail);
+}
+
+// ---------------------------------------------------------------------
+// Send email API (Gmail SMTP relay) - a generic endpoint any of your own
+// backend services can call to send a real email, authenticated with a
+// shared API key. Speaks raw SMTP over a TCP socket to smtp.gmail.com -
+// Workers can't run a Node SMTP library, but the native cloudflare:sockets
+// API is exactly what Cloudflare recommends for this.
+// ---------------------------------------------------------------------
+
+async function handleSendEmail(request, env) {
+  const corsHeaders = buildCorsHeaders(request);
+
+  if (request.method === 'OPTIONS') {
+    return new Response(null, { status: 204, headers: corsHeaders });
+  }
+  if (request.method !== 'POST') {
+    return jsonResponse({ error: 'Method not allowed' }, 405, corsHeaders);
+  }
+
+  if (!isAuthorized(request, env)) {
+    return jsonResponse({ error: 'Unauthorized' }, 401, corsHeaders);
+  }
+
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return jsonResponse({ error: 'Invalid JSON body' }, 400, corsHeaders);
+  }
+
+  const to = normalizeRecipients(body.to);
+  const subject = typeof body.subject === 'string' ? sanitizeHeaderValue(body.subject).trim() : '';
+  const text = typeof body.text === 'string' ? body.text : '';
+  const html = typeof body.html === 'string' ? body.html : '';
+  const replyTo = typeof body.replyTo === 'string' ? body.replyTo.trim() : '';
+  const fromName = typeof body.fromName === 'string' ? sanitizeHeaderValue(body.fromName).trim() : '';
+
+  if (!to.length || !subject || (!text && !html)) {
+    return jsonResponse({ error: 'to, subject and text or html are required' }, 400, corsHeaders);
+  }
+  if (!to.every((addr) => EMAIL_ADDRESS_PATTERN.test(addr))) {
+    return jsonResponse({ error: 'One or more recipient addresses are invalid' }, 400, corsHeaders);
+  }
+  if (to.length > MAX_SEND_EMAIL_RECIPIENTS) {
+    return jsonResponse({ error: `Too many recipients (max ${MAX_SEND_EMAIL_RECIPIENTS})` }, 400, corsHeaders);
+  }
+  if (replyTo && !EMAIL_ADDRESS_PATTERN.test(replyTo)) {
+    return jsonResponse({ error: 'Invalid replyTo address' }, 400, corsHeaders);
+  }
+
+  try {
+    await sendViaGmailSmtp(env, {
+      to,
+      subject: truncate(subject, MAX_SEND_EMAIL_SUBJECT_LENGTH),
+      text: truncate(text, MAX_SEND_EMAIL_BODY_LENGTH),
+      html: truncate(html, MAX_SEND_EMAIL_BODY_LENGTH),
+      replyTo,
+      fromName,
+    });
+  } catch (err) {
+    console.error('send-email failed:', err);
+    return jsonResponse({ error: 'Failed to send email' }, 502, corsHeaders);
+  }
+
+  return jsonResponse({ ok: true }, 200, corsHeaders);
+}
+
+// Constant-time-ish API key check via Authorization: Bearer <key>.
+function isAuthorized(request, env) {
+  if (!env.SEND_EMAIL_API_KEY) {
+    console.error('Missing SEND_EMAIL_API_KEY secret - run `wrangler secret put SEND_EMAIL_API_KEY`');
+    return false;
+  }
+  const auth = request.headers.get('Authorization') || '';
+  const provided = auth.startsWith('Bearer ') ? auth.slice(7) : '';
+  return timingSafeEqual(provided, env.SEND_EMAIL_API_KEY);
+}
+
+function timingSafeEqual(a, b) {
+  const bufA = new TextEncoder().encode(a);
+  const bufB = new TextEncoder().encode(b);
+  const length = Math.max(bufA.length, bufB.length, 1);
+  let diff = bufA.length === bufB.length ? 0 : 1;
+  for (let i = 0; i < length; i++) {
+    diff |= (bufA[i] ?? 0) ^ (bufB[i] ?? 0);
+  }
+  return diff === 0;
+}
+
+function normalizeRecipients(input) {
+  const list = Array.isArray(input) ? input : typeof input === 'string' ? [input] : [];
+  return list.map((addr) => (typeof addr === 'string' ? addr.trim() : '')).filter(Boolean);
+}
+
+async function sendViaGmailSmtp(env, { to, subject, text, html, replyTo, fromName }) {
+  if (!env.GMAIL_SMTP_USER || !env.GMAIL_SMTP_APP_PASSWORD) {
+    throw new Error('Missing GMAIL_SMTP_USER / GMAIL_SMTP_APP_PASSWORD secrets - see README.md');
+  }
+
+  const mime = createMimeMessage();
+  mime.setSender({ name: fromName || AUTO_REPLY_FROM_NAME, addr: env.GMAIL_SMTP_USER });
+  to.forEach((addr) => mime.setRecipient(addr));
+  if (replyTo) mime.setHeader('Reply-To', replyTo);
+  mime.setSubject(subject);
+  if (html) mime.addMessage({ contentType: 'text/html', data: html });
+  if (text || !html) mime.addMessage({ contentType: 'text/plain', data: text || '' });
+
+  const client = new SmtpClient(GMAIL_SMTP_HOST, GMAIL_SMTP_PORT);
+  try {
+    await client.connect();
+    await client.expect(220); // server greeting
+    await client.command(`EHLO ${SMTP_EHLO_DOMAIN}`, 250);
+    await client.command('STARTTLS', 220);
+    await client.upgradeToTls();
+    await client.command(`EHLO ${SMTP_EHLO_DOMAIN}`, 250); // re-greet, required after STARTTLS
+
+    await client.command('AUTH LOGIN', 334);
+    await client.command(btoa(env.GMAIL_SMTP_USER), 334);
+    await client.command(btoa(env.GMAIL_SMTP_APP_PASSWORD), 235);
+
+    await client.command(`MAIL FROM:<${env.GMAIL_SMTP_USER}>`, 250);
+    for (const addr of to) {
+      await client.command(`RCPT TO:<${addr}>`, 250);
+    }
+
+    await client.command('DATA', 354);
+    await client.sendData(mime.asRaw());
+
+    await client.command('QUIT', 221).catch(() => {}); // best effort - message is already sent
+  } finally {
+    await client.close();
+  }
+}
+
+// Minimal SMTP client over a raw TCP socket - just enough of RFC 5321 to
+// talk to Gmail: EHLO, STARTTLS, AUTH LOGIN, MAIL/RCPT/DATA.
+class SmtpClient {
+  constructor(hostname, port) {
+    this.hostname = hostname;
+    this.port = port;
+    this.socket = null;
+    this.writer = null;
+    this.reader = null;
+    this.buffer = '';
+    this.encoder = new TextEncoder();
+    this.decoder = new TextDecoder();
+  }
+
+  async connect() {
+    this.socket = connect({ hostname: this.hostname, port: this.port }, { secureTransport: 'starttls' });
+    this.writer = this.socket.writable.getWriter();
+    this.reader = this.socket.readable.getReader();
+  }
+
+  async upgradeToTls() {
+    await this.reader.releaseLock();
+    await this.writer.releaseLock();
+    this.socket = this.socket.startTls();
+    this.writer = this.socket.writable.getWriter();
+    this.reader = this.socket.readable.getReader();
+  }
+
+  async readLine() {
+    while (!this.buffer.includes('\r\n')) {
+      const { value, done } = await this.reader.read();
+      if (done) throw new Error('SMTP connection closed unexpectedly');
+      this.buffer += this.decoder.decode(value, { stream: true });
+    }
+    const idx = this.buffer.indexOf('\r\n');
+    const line = this.buffer.slice(0, idx);
+    this.buffer = this.buffer.slice(idx + 2);
+    return line;
+  }
+
+  // SMTP responses can be multi-line: "250-foo\r\n250-bar\r\n250 baz\r\n" -
+  // keep reading until a line has a space (not a dash) after the code.
+  async readResponse() {
+    let code, lines = [];
+    do {
+      const line = await this.readLine();
+      lines.push(line);
+      code = line.slice(0, 3);
+    } while (lines[lines.length - 1][3] === '-');
+    return { code: Number(code), message: lines.join('\n') };
+  }
+
+  async expect(expectedCode) {
+    const { code, message } = await this.readResponse();
+    if (code !== expectedCode) {
+      throw new Error(`SMTP error: expected ${expectedCode}, got "${message}"`);
+    }
+    return message;
+  }
+
+  async write(line) {
+    await this.writer.write(this.encoder.encode(line + '\r\n'));
+  }
+
+  async command(line, expectedCode) {
+    await this.write(line);
+    return this.expect(expectedCode);
+  }
+
+  // Dot-stuff (SMTP transparency: a line starting with "." is escaped as
+  // "..") and terminate with the standard "\r\n.\r\n" end-of-DATA marker.
+  async sendData(raw) {
+    const stuffed = raw.replace(/^\./gm, '..');
+    await this.writer.write(this.encoder.encode(stuffed + '\r\n.\r\n'));
+    return this.expect(250);
+  }
+
+  async close() {
+    try {
+      await this.writer?.close();
+    } catch {
+      /* socket may already be closing */
+    }
+  }
 }
 
 // ---------------------------------------------------------------------
