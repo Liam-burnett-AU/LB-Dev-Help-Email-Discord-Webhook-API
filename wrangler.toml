@@ -53,6 +53,12 @@ name = "SEND_EMAIL"
 #                                                    callers of POST /api/send must send this as
 #                                                    `Authorization: Bearer <key>`. Backend-to-backend
 #                                                    only - never embed it in browser/client code.)
+#   wrangler secret put GMAIL_SMTP_FROM_ALIAS      (optional - send as a different address than
+#                                                    GMAIL_SMTP_USER, e.g. help@lbdev.app. Only works
+#                                                    if that address is already a verified "Send As"
+#                                                    alias on the GMAIL_SMTP_USER account - Gmail
+#                                                    Settings > Accounts > Send mail as. Auth always
+#                                                    happens as GMAIL_SMTP_USER either way.)
 #
 # cloudflare:sockets (used by /api/send to speak SMTP) is a native Workers
 # API - no binding or extra config needed, but raw TCP sockets require a

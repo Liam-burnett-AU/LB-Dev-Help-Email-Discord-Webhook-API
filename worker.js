@@ -36,6 +36,11 @@
  *      4. wrangler secret put SEND_EMAIL_API_KEY   (a random shared secret -
  *         every caller must send it; NEVER call this from browser JS, the
  *         key would leak. Backend-to-backend only.)
+ *      5. (optional) wrangler secret put GMAIL_SMTP_FROM_ALIAS - send as a
+ *         different address than GMAIL_SMTP_USER, e.g. help@lbdev.app,
+ *         IF it's already a verified "Send As" alias on that Google account
+ *         (Gmail Settings -> Accounts -> Send mail as). Auth always happens
+ *         as GMAIL_SMTP_USER regardless.
  *    Then: wrangler deploy
  * =========================================================================
  */
@@ -454,8 +459,15 @@ async function sendViaGmailSmtp(env, { to, subject, text, html, replyTo, fromNam
     throw new Error('Missing GMAIL_SMTP_USER / GMAIL_SMTP_APP_PASSWORD secrets - see README.md');
   }
 
+  // Auth is always the real Google account. The visible/envelope sender can
+  // be a different address IF it's a verified "Send As" alias on that same
+  // account (Gmail settings -> Accounts -> Send mail as) - Gmail checks this
+  // server-side and rejects MAIL FROM otherwise. Leave GMAIL_SMTP_FROM_ALIAS
+  // unset to just send as GMAIL_SMTP_USER itself.
+  const fromAddr = env.GMAIL_SMTP_FROM_ALIAS || env.GMAIL_SMTP_USER;
+
   const mime = createMimeMessage();
-  mime.setSender({ name: fromName || AUTO_REPLY_FROM_NAME, addr: env.GMAIL_SMTP_USER });
+  mime.setSender({ name: fromName || AUTO_REPLY_FROM_NAME, addr: fromAddr });
   to.forEach((addr) => mime.setRecipient(addr));
   if (replyTo) mime.setHeader('Reply-To', replyTo);
   mime.setSubject(subject);
@@ -475,7 +487,7 @@ async function sendViaGmailSmtp(env, { to, subject, text, html, replyTo, fromNam
     await client.command(btoa(env.GMAIL_SMTP_USER), 334);
     await client.command(btoa(env.GMAIL_SMTP_APP_PASSWORD), 235);
 
-    await client.command(`MAIL FROM:<${env.GMAIL_SMTP_USER}>`, 250);
+    await client.command(`MAIL FROM:<${fromAddr}>`, 250);
     for (const addr of to) {
       await client.command(`RCPT TO:<${addr}>`, 250);
     }

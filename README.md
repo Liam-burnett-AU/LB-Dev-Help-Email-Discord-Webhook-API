@@ -74,7 +74,9 @@ handleSendEmail()
   2. builds a MIME message
   3. SmtpClient opens a raw TCP socket to smtp.gmail.com:587
      EHLO → STARTTLS → (upgrade to TLS) → EHLO → AUTH LOGIN → MAIL FROM → RCPT TO → DATA
-  4. authenticates as GMAIL_SMTP_USER with an App Password
+  4. authenticates as GMAIL_SMTP_USER with an App Password; sends as
+     GMAIL_SMTP_FROM_ALIAS if set (must be a verified Send As alias), else
+     as GMAIL_SMTP_USER itself
 ```
 
 There's no library doing this — Workers can't run a Node SMTP client like `nodemailer`, so `SmtpClient` is a minimal hand-rolled SMTP/RFC 5321 client built on Cloudflare's native [`cloudflare:sockets`](https://developers.cloudflare.com/workers/runtime-apis/tcp-sockets/) TCP API, which is exactly what Cloudflare recommends for this.
@@ -189,7 +191,13 @@ openssl rand -hex 32
 
 Every caller of `/api/send` must send this key back as `Authorization: Bearer <key>`. Treat it like a password — store it in your other apps' own secret manager (env vars, a vault, etc.), never in client-side/browser code, and rotate it (`wrangler secret put SEND_EMAIL_API_KEY` again) if it's ever exposed.
 
-4. Redeploy: `npm run deploy`.
+4. **(Optional) Send as a different address than `GMAIL_SMTP_USER`** — e.g. you authenticate as `liamburnett40@gmail.com` but want mail to go out as `help@lbdev.app`. This only works if `help@lbdev.app` is already set up as a verified **Send As** alias on that Gmail account (Gmail → Settings → Accounts → **Send mail as**) — Gmail checks this server-side and rejects the message otherwise. Authentication always still happens as `GMAIL_SMTP_USER`; this doesn't change that, it only changes who the mail appears to be from.
+
+```bash
+wrangler secret put GMAIL_SMTP_FROM_ALIAS       # e.g. help@lbdev.app — omit entirely to just send as GMAIL_SMTP_USER
+```
+
+5. Redeploy: `npm run deploy`.
 
 ---
 
@@ -249,7 +257,7 @@ Request body (JSON):
 | `to` | yes | A string, or an array of strings, for multiple recipients (max `MAX_SEND_EMAIL_RECIPIENTS`, default 10) |
 | `subject` | yes | Plain text |
 | `text` and/or `html` | at least one | Plain-text and/or HTML body |
-| `fromName` | no | Display name on the "From" header — the address itself is always `GMAIL_SMTP_USER`, Gmail rejects attempts to spoof a different one |
+| `fromName` | no | Display name on the "From" header — the address itself is always `GMAIL_SMTP_FROM_ALIAS` (if set) or `GMAIL_SMTP_USER`, Gmail rejects attempts to spoof anything else |
 | `replyTo` | no | Sets a `Reply-To` header |
 
 Responses:
@@ -289,7 +297,7 @@ await fetch('https://worker.lbdev.app/api/send', {
 - **The API key is checked with a constant-time comparison** (`timingSafeEqual` in `worker.js`), not `===`, so a mistimed network attacker can't incrementally guess it character-by-character.
 - **Use an App Password, never your real Gmail password.** App Passwords are scoped, revocable independently, and don't work if 2-Step Verification is later disabled — all strictly safer than your account password.
 - **Rotate the key** if it's ever committed, logged, or shared somewhere it shouldn't be: `wrangler secret put SEND_EMAIL_API_KEY`.
-- **"From" can't be spoofed.** The sender address is always `GMAIL_SMTP_USER` — Gmail enforces this at submission time, so `/api/send` can't be used to send mail *as* an arbitrary address, only *from* your own authenticated account.
+- **"From" can't be spoofed.** The sender address is always `GMAIL_SMTP_FROM_ALIAS` (if set) or `GMAIL_SMTP_USER` — and Gmail itself only accepts the alias if it's already a verified Send As address on that account. `/api/send` can't be used to send mail *as* an arbitrary address, only *from* your own authenticated account or its verified aliases.
 - **Header injection is blocked.** `subject` and `fromName` (on both `/api/send` and `/api/contact`) are stripped of `\r\n` before being used in a MIME header, so a caller can't smuggle an extra header (e.g. a fake `Bcc:`) into an outgoing message.
 - Consider adding a [Cloudflare Rate Limiting Rule](https://developers.cloudflare.com/waf/rate-limiting-rules/) on the `worker.lbdev.app/api/send` route if you're worried about a leaked key being used to send a high volume of mail — this project doesn't implement its own rate limiting.
 
@@ -370,7 +378,7 @@ npm run tail
 - **Contact form request blocked by CORS in the browser** — add your site's origin to `CONTACT_FORM_ALLOWED_ORIGINS`, or leave it empty to allow any origin.
 - **Auto-reply never arrives** — check `wrangler tail` for `Contact form auto-reply failed`. If the binding has `destination_address`/`allowed_destination_addresses` set in `wrangler.toml`, remove it — the auto-reply needs to send to arbitrary visitor addresses. Set `AUTO_REPLY_ENABLED = false` to turn it off entirely.
 - **`/api/send` returns `401 Unauthorized`** — the `Authorization: Bearer <key>` header is missing, wrong, or `SEND_EMAIL_API_KEY` isn't set on the Worker (`wrangler secret put SEND_EMAIL_API_KEY`).
-- **`/api/send` returns `502 Failed to send email`** — check `wrangler tail` for the real SMTP error. Common causes: wrong App Password (regenerate it), 2-Step Verification got turned off (App Passwords stop working), or `GMAIL_SMTP_USER`/`GMAIL_SMTP_APP_PASSWORD` not set.
+- **`/api/send` returns `502 Failed to send email`** — check `wrangler tail` for the real SMTP error. Common causes: wrong App Password (regenerate it), 2-Step Verification got turned off (App Passwords stop working), `GMAIL_SMTP_USER`/`GMAIL_SMTP_APP_PASSWORD` not set, or a `GMAIL_SMTP_FROM_ALIAS` that isn't a verified Send As address on that account (the `MAIL FROM` step gets rejected — add/verify the alias under Gmail → Settings → Accounts → Send mail as, or unset `GMAIL_SMTP_FROM_ALIAS`).
 - **`/api/send` hangs or times out** — TCP Sockets need a paid Workers plan; on the free plan `connect()` will fail outright. Confirm your plan under the Cloudflare dashboard's Workers & Pages section.
 
 ---
