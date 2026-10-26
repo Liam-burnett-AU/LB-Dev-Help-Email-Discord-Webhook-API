@@ -15,8 +15,11 @@
  *         *different* Discord forum channel, emails you a copy (via the
  *         send_email binding) and auto-replies to the sender.
  *       POST /api/send - a generic "send an email" endpoint any of your
- *         other apps can call (with an API key) to send a real email
- *         through Gmail's SMTP server, using raw TCP sockets + STARTTLS.
+ *         other apps can call (with an API key) to send a real email via
+ *         Cloudflare's own send_email binding - no raw sockets, so it
+ *         works on the free Workers plan too (earlier versions of this
+ *         relayed through Gmail's SMTP server directly over a raw TCP
+ *         socket, which needs a paid plan - see git history).
  *
  *  Full setup walkthrough is in README.md. Quick version:
  *    Email -> Discord:
@@ -29,18 +32,11 @@
  *      2. wrangler secret put CONTACT_DISCORD_WEBHOOK_URL
  *      3. Add a [[send_email]] binding in wrangler.toml (see comments there).
  *    Send email API (/api/send):
- *      1. Enable 2-Step Verification on the Gmail account, then create an
- *         App Password at myaccount.google.com/apppasswords.
- *      2. wrangler secret put GMAIL_SMTP_USER
- *      3. wrangler secret put GMAIL_SMTP_APP_PASSWORD
- *      4. wrangler secret put SEND_EMAIL_API_KEY   (a random shared secret -
+ *      1. Reuses the same [[send_email]] binding as the contact form - no
+ *         extra Cloudflare setup needed.
+ *      2. wrangler secret put SEND_EMAIL_API_KEY   (a random shared secret -
  *         every caller must send it; NEVER call this from browser JS, the
  *         key would leak. Backend-to-backend only.)
- *      5. (optional) wrangler secret put GMAIL_SMTP_FROM_ALIAS - send as a
- *         different address than GMAIL_SMTP_USER, e.g. help@lbdev.app,
- *         IF it's already a verified "Send As" alias on that Google account
- *         (Gmail Settings -> Accounts -> Send mail as). Auth always happens
- *         as GMAIL_SMTP_USER regardless.
  *    Then: wrangler deploy
  * =========================================================================
  */
@@ -48,7 +44,6 @@
 import PostalMime from 'postal-mime';
 import { createMimeMessage } from 'mimetext';
 import { EmailMessage } from 'cloudflare:email';
-import { connect } from 'cloudflare:sockets';
 
 // ---------------------------------------------------------------------
 // Configuration - tweak these to taste
@@ -110,11 +105,11 @@ function sanitizeHeaderValue(str) {
 }
 
 // ---------------------------------------------------------------------
-// Send email API config (Gmail SMTP relay)
+// Send email API config
 // ---------------------------------------------------------------------
-const GMAIL_SMTP_HOST = 'smtp.gmail.com';
-const GMAIL_SMTP_PORT = 587; // STARTTLS, not implicit TLS (465)
-const SMTP_EHLO_DOMAIN = 'lbdev.app'; // identifies this client in the EHLO greeting - doesn't need to resolve
+// The "From" address for /api/send, via the same send_email binding the
+// contact form uses. Must be on a domain you've enabled Email Routing for.
+const SEND_EMAIL_FROM_EMAIL = 'help@lbdev.app';
 const MAX_SEND_EMAIL_RECIPIENTS = 10;
 const MAX_SEND_EMAIL_SUBJECT_LENGTH = 256;
 const MAX_SEND_EMAIL_BODY_LENGTH = 100_000;
@@ -362,11 +357,11 @@ async function sendAutoReply(env, { name, email, subject }) {
 }
 
 // ---------------------------------------------------------------------
-// Send email API (Gmail SMTP relay) - a generic endpoint any of your own
-// backend services can call to send a real email, authenticated with a
-// shared API key. Speaks raw SMTP over a TCP socket to smtp.gmail.com -
-// Workers can't run a Node SMTP library, but the native cloudflare:sockets
-// API is exactly what Cloudflare recommends for this.
+// Send email API - a generic endpoint any of your own backend services
+// can call to send a real email, authenticated with a shared API key.
+// Goes through the same send_email binding as the contact form, so
+// unlike the raw-SMTP approach this previously used, it works on the
+// free Workers plan (no TCP Sockets needed).
 // ---------------------------------------------------------------------
 
 async function handleSendEmail(request, env) {
@@ -411,7 +406,7 @@ async function handleSendEmail(request, env) {
   }
 
   try {
-    await sendViaGmailSmtp(env, {
+    await sendOutboundEmail(env, {
       to,
       subject: truncate(subject, MAX_SEND_EMAIL_SUBJECT_LENGTH),
       text: truncate(text, MAX_SEND_EMAIL_BODY_LENGTH),
@@ -454,137 +449,24 @@ function normalizeRecipients(input) {
   return list.map((addr) => (typeof addr === 'string' ? addr.trim() : '')).filter(Boolean);
 }
 
-async function sendViaGmailSmtp(env, { to, subject, text, html, replyTo, fromName }) {
-  if (!env.GMAIL_SMTP_USER || !env.GMAIL_SMTP_APP_PASSWORD) {
-    throw new Error('Missing GMAIL_SMTP_USER / GMAIL_SMTP_APP_PASSWORD secrets - see README.md');
+async function sendOutboundEmail(env, { to, subject, text, html, replyTo, fromName }) {
+  if (!env.SEND_EMAIL) {
+    throw new Error('Missing SEND_EMAIL binding - add a [[send_email]] block to wrangler.toml and redeploy');
   }
 
-  // Auth is always the real Google account. The visible/envelope sender can
-  // be a different address IF it's a verified "Send As" alias on that same
-  // account (Gmail settings -> Accounts -> Send mail as) - Gmail checks this
-  // server-side and rejects MAIL FROM otherwise. Leave GMAIL_SMTP_FROM_ALIAS
-  // unset to just send as GMAIL_SMTP_USER itself.
-  const fromAddr = env.GMAIL_SMTP_FROM_ALIAS || env.GMAIL_SMTP_USER;
-
   const mime = createMimeMessage();
-  mime.setSender({ name: fromName || AUTO_REPLY_FROM_NAME, addr: fromAddr });
+  mime.setSender({ name: fromName || AUTO_REPLY_FROM_NAME, addr: SEND_EMAIL_FROM_EMAIL });
   to.forEach((addr) => mime.setRecipient(addr));
   if (replyTo) mime.setHeader('Reply-To', replyTo);
   mime.setSubject(subject);
   if (html) mime.addMessage({ contentType: 'text/html', data: html });
   if (text || !html) mime.addMessage({ contentType: 'text/plain', data: text || '' });
 
-  const client = new SmtpClient(GMAIL_SMTP_HOST, GMAIL_SMTP_PORT);
-  try {
-    await client.connect();
-    await client.expect(220); // server greeting
-    await client.command(`EHLO ${SMTP_EHLO_DOMAIN}`, 250);
-    await client.command('STARTTLS', 220);
-    await client.upgradeToTls();
-    await client.command(`EHLO ${SMTP_EHLO_DOMAIN}`, 250); // re-greet, required after STARTTLS
-
-    await client.command('AUTH LOGIN', 334);
-    await client.command(btoa(env.GMAIL_SMTP_USER), 334);
-    await client.command(btoa(env.GMAIL_SMTP_APP_PASSWORD), 235);
-
-    await client.command(`MAIL FROM:<${fromAddr}>`, 250);
-    for (const addr of to) {
-      await client.command(`RCPT TO:<${addr}>`, 250);
-    }
-
-    await client.command('DATA', 354);
-    await client.sendData(mime.asRaw());
-
-    await client.command('QUIT', 221).catch(() => {}); // best effort - message is already sent
-  } finally {
-    await client.close();
-  }
-}
-
-// Minimal SMTP client over a raw TCP socket - just enough of RFC 5321 to
-// talk to Gmail: EHLO, STARTTLS, AUTH LOGIN, MAIL/RCPT/DATA.
-class SmtpClient {
-  constructor(hostname, port) {
-    this.hostname = hostname;
-    this.port = port;
-    this.socket = null;
-    this.writer = null;
-    this.reader = null;
-    this.buffer = '';
-    this.encoder = new TextEncoder();
-    this.decoder = new TextDecoder();
-  }
-
-  async connect() {
-    this.socket = connect({ hostname: this.hostname, port: this.port }, { secureTransport: 'starttls' });
-    this.writer = this.socket.writable.getWriter();
-    this.reader = this.socket.readable.getReader();
-  }
-
-  async upgradeToTls() {
-    await this.reader.releaseLock();
-    await this.writer.releaseLock();
-    this.socket = this.socket.startTls();
-    this.writer = this.socket.writable.getWriter();
-    this.reader = this.socket.readable.getReader();
-  }
-
-  async readLine() {
-    while (!this.buffer.includes('\r\n')) {
-      const { value, done } = await this.reader.read();
-      if (done) throw new Error('SMTP connection closed unexpectedly');
-      this.buffer += this.decoder.decode(value, { stream: true });
-    }
-    const idx = this.buffer.indexOf('\r\n');
-    const line = this.buffer.slice(0, idx);
-    this.buffer = this.buffer.slice(idx + 2);
-    return line;
-  }
-
-  // SMTP responses can be multi-line: "250-foo\r\n250-bar\r\n250 baz\r\n" -
-  // keep reading until a line has a space (not a dash) after the code.
-  async readResponse() {
-    let code, lines = [];
-    do {
-      const line = await this.readLine();
-      lines.push(line);
-      code = line.slice(0, 3);
-    } while (lines[lines.length - 1][3] === '-');
-    return { code: Number(code), message: lines.join('\n') };
-  }
-
-  async expect(expectedCode) {
-    const { code, message } = await this.readResponse();
-    if (code !== expectedCode) {
-      throw new Error(`SMTP error: expected ${expectedCode}, got "${message}"`);
-    }
-    return message;
-  }
-
-  async write(line) {
-    await this.writer.write(this.encoder.encode(line + '\r\n'));
-  }
-
-  async command(line, expectedCode) {
-    await this.write(line);
-    return this.expect(expectedCode);
-  }
-
-  // Dot-stuff (SMTP transparency: a line starting with "." is escaped as
-  // "..") and terminate with the standard "\r\n.\r\n" end-of-DATA marker.
-  async sendData(raw) {
-    const stuffed = raw.replace(/^\./gm, '..');
-    await this.writer.write(this.encoder.encode(stuffed + '\r\n.\r\n'));
-    return this.expect(250);
-  }
-
-  async close() {
-    try {
-      await this.writer?.close();
-    } catch {
-      /* socket may already be closing */
-    }
-  }
+  const raw = mime.asRaw();
+  // One send per recipient (the send_email binding takes a single envelope
+  // "to"), all sharing the same message - everyone still sees the full
+  // recipient list in the "To" header above.
+  await Promise.all(to.map((addr) => env.SEND_EMAIL.send(new EmailMessage(SEND_EMAIL_FROM_EMAIL, addr, raw))));
 }
 
 // ---------------------------------------------------------------------

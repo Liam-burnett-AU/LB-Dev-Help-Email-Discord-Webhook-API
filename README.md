@@ -5,9 +5,9 @@ A small [Cloudflare Worker](https://workers.cloudflare.com/) with two independen
 1. **`email()`** — a [Cloudflare Email Worker](https://developers.cloudflare.com/email-routing/email-workers/) that catches email sent to an address on your domain, parses it, and posts it as a new thread in a Discord **forum channel**. Optionally forwards a copy of the original email to a real inbox too.
 2. **`fetch()`** — routes two JSON APIs by path:
    - `POST /api/contact` — a "contact me" form endpoint. Posts a thread to a *different* Discord forum channel, emails you a copy, and auto-replies to the sender.
-   - `POST /api/send` — a generic, API-key-authenticated endpoint any of your other apps can call to send a real email through **Gmail's SMTP server**.
+   - `POST /api/send` — a generic, API-key-authenticated endpoint any of your other apps can call to send a real email, via the same Cloudflare `send_email` binding as the contact form.
 
-Built for `help@lbdev.app` (email in), `worker.lbdev.app/api/contact` (contact form in) and `worker.lbdev.app/api/send` (any app, out via Gmail) — Discord thread out, with copies landing in a normal inbox if you want them.
+Built for `help@lbdev.app` (email in), `worker.lbdev.app/api/contact` (contact form in) and `worker.lbdev.app/api/send` (any app, out) — Discord thread out, with copies landing in a normal inbox if you want them.
 
 ---
 
@@ -58,7 +58,7 @@ postContactToDiscord() sendContactNotification() sendAutoReply()
 
 Same independence guarantee as the email flow — a Discord outage doesn't stop the notification email, and vice versa. The auto-reply is a courtesy on top and never affects the response status. The API responds `502` only if **both** the Discord post and your notification email fail.
 
-### Send email API → Gmail SMTP
+### Send email API
 
 ```
 Any of your apps/services (backend only)
@@ -71,15 +71,12 @@ this Worker's fetch() handler
       ▼
 handleSendEmail()
   1. checks the API key (constant-time compare)
-  2. builds a MIME message
-  3. SmtpClient opens a raw TCP socket to smtp.gmail.com:587
-     EHLO → STARTTLS → (upgrade to TLS) → EHLO → AUTH LOGIN → MAIL FROM → RCPT TO → DATA
-  4. authenticates as GMAIL_SMTP_USER with an App Password; sends as
-     GMAIL_SMTP_FROM_ALIAS if set (must be a verified Send As alias), else
-     as GMAIL_SMTP_USER itself
+  2. builds a MIME message, one "To" per recipient listed
+  3. sendOutboundEmail() sends it via the send_email binding -
+     one env.SEND_EMAIL.send() call per recipient, same message body
 ```
 
-There's no library doing this — Workers can't run a Node SMTP client like `nodemailer`, so `SmtpClient` is a minimal hand-rolled SMTP/RFC 5321 client built on Cloudflare's native [`cloudflare:sockets`](https://developers.cloudflare.com/workers/runtime-apis/tcp-sockets/) TCP API, which is exactly what Cloudflare recommends for this.
+This used to relay through Gmail's SMTP server directly over a raw TCP socket (`cloudflare:sockets`), hand-rolling the SMTP protocol — that's a Workers Paid plan feature, so it broke on the free plan. It now goes through the same `send_email` binding the contact form already uses, which works on free. The earlier Gmail-SMTP version is still in git history if you're on a paid plan and want that back (it lets you send *as* a real Gmail account rather than an Email-Routing-verified domain address).
 
 **This is the only endpoint in the project that isn't scoped to your own forms** — it's meant to be called from other backends you control, which is why it's the one place an API key is mandatory. See **Security** below before exposing it anywhere.
 
@@ -89,9 +86,8 @@ There's no library doing this — Workers can't run a Node SMTP client like `nod
 
 - A domain on Cloudflare with [Email Routing](https://developers.cloudflare.com/email-routing/) enabled.
 - A Discord server with **forum channels** (this only works with forum channels — the webhook needs `thread_name` support). You can use the same forum for both flows, or two different ones.
-- A **paid Workers plan** — the `/api/send` endpoint uses raw [TCP Sockets](https://developers.cloudflare.com/workers/runtime-apis/tcp-sockets/), which aren't available on the free plan.
-- A Google account with **2-Step Verification enabled** (required to generate an App Password for Gmail SMTP), if you want `/api/send`.
 - [Node.js](https://nodejs.org/) and [Wrangler](https://developers.cloudflare.com/workers/wrangler/) (installed as a dev dependency below).
+- No paid Workers plan needed — everything in this project, including `/api/send`, runs on the free plan.
 
 ---
 
@@ -171,19 +167,15 @@ await fetch('https://worker.lbdev.app/api/contact', {
 });
 ```
 
-### 9. Set up the Gmail SMTP relay (for `/api/send`)
+### 9. Set up the send-email API (`/api/send`)
 
-1. On the Gmail account you want to send from, turn on **2-Step Verification**: [myaccount.google.com/signinoptions/two-step-verification](https://myaccount.google.com/signinoptions/two-step-verification).
-2. Generate an **App Password**: [myaccount.google.com/apppasswords](https://myaccount.google.com/apppasswords). Give it a name like "lbdev worker", copy the 16-character password it gives you — this is **not** your normal Gmail password, and Google won't show it again.
-3. Set the secrets:
+It reuses the same `[[send_email]]` binding from step 4 — no Google account or App Password needed. Just set the API key every caller has to present:
 
 ```bash
-wrangler secret put GMAIL_SMTP_USER             # the Gmail address itself, e.g. you@gmail.com
-wrangler secret put GMAIL_SMTP_APP_PASSWORD     # the 16-character App Password from step 2
 wrangler secret put SEND_EMAIL_API_KEY          # a random shared secret - generate one below
 ```
 
-Generate a strong random key for `SEND_EMAIL_API_KEY`:
+Generate a strong random key:
 
 ```bash
 openssl rand -hex 32
@@ -191,13 +183,9 @@ openssl rand -hex 32
 
 Every caller of `/api/send` must send this key back as `Authorization: Bearer <key>`. Treat it like a password — store it in your other apps' own secret manager (env vars, a vault, etc.), never in client-side/browser code, and rotate it (`wrangler secret put SEND_EMAIL_API_KEY` again) if it's ever exposed.
 
-4. **(Optional) Send as a different address than `GMAIL_SMTP_USER`** — e.g. you authenticate as `liamburnett40@gmail.com` but want mail to go out as `help@lbdev.app`. This only works if `help@lbdev.app` is already set up as a verified **Send As** alias on that Gmail account (Gmail → Settings → Accounts → **Send mail as**) — Gmail checks this server-side and rejects the message otherwise. Authentication always still happens as `GMAIL_SMTP_USER`; this doesn't change that, it only changes who the mail appears to be from.
+The "From" address is `SEND_EMAIL_FROM_EMAIL` in `worker.js` (defaults to `help@lbdev.app`) — change it there and redeploy if you want a different one. It must be on a domain you've enabled Email Routing for, same as `CONTACT_FORM_FROM_EMAIL`.
 
-```bash
-wrangler secret put GMAIL_SMTP_FROM_ALIAS       # e.g. help@lbdev.app — omit entirely to just send as GMAIL_SMTP_USER
-```
-
-5. Redeploy: `npm run deploy`.
+Redeploy: `npm run deploy`.
 
 ---
 
@@ -257,18 +245,18 @@ Request body (JSON):
 | `to` | yes | A string, or an array of strings, for multiple recipients (max `MAX_SEND_EMAIL_RECIPIENTS`, default 10) |
 | `subject` | yes | Plain text |
 | `text` and/or `html` | at least one | Plain-text and/or HTML body |
-| `fromName` | no | Display name on the "From" header — the address itself is always `GMAIL_SMTP_FROM_ALIAS` (if set) or `GMAIL_SMTP_USER`, Gmail rejects attempts to spoof anything else |
+| `fromName` | no | Display name on the "From" header — the address itself is always `SEND_EMAIL_FROM_EMAIL` (a constant in `worker.js`), not something a caller can change |
 | `replyTo` | no | Sets a `Reply-To` header |
 
 Responses:
 
 | Status | Meaning |
 |---|---|
-| `200 { "ok": true }` | Sent via Gmail SMTP |
+| `200 { "ok": true }` | Sent via the `send_email` binding |
 | `400 { "error": "..." }` | Missing/invalid field, or too many recipients |
 | `401 { "error": "Unauthorized" }` | Missing/incorrect `Authorization` header, or `SEND_EMAIL_API_KEY` isn't configured |
 | `405 { "error": "Method not allowed" }` | Anything other than `POST`/`OPTIONS` |
-| `502 { "error": "Failed to send email" }` | The SMTP conversation with Gmail failed — check `wrangler tail` for the real reason |
+| `502 { "error": "Failed to send email" }` | The `send_email` binding rejected the message — check `wrangler tail` for the real reason |
 
 **Example (Node/any backend):**
 
@@ -282,7 +270,7 @@ await fetch('https://worker.lbdev.app/api/send', {
   body: JSON.stringify({
     to: 'someone@example.com',
     subject: 'Hello from another app',
-    text: 'This came through the Gmail SMTP relay.',
+    text: 'This came through the send-email API.',
   }),
 });
 ```
@@ -293,11 +281,10 @@ await fetch('https://worker.lbdev.app/api/send', {
 
 `/api/send` is deliberately the most locked-down endpoint in this project, because unlike `/api/contact` it isn't scoped to one form on one site — it's a general-purpose "send an email as me" capability.
 
-- **Never call `/api/send` from browser/client-side JavaScript.** The `Authorization` header would be visible to anyone who opens dev tools, and `SEND_EMAIL_API_KEY` would effectively become public — turning this into an open relay anyone could use to send mail as your Gmail account. Only call it from code that runs on a server you control.
+- **Never call `/api/send` from browser/client-side JavaScript.** The `Authorization` header would be visible to anyone who opens dev tools, and `SEND_EMAIL_API_KEY` would effectively become public — turning this into an open relay anyone could use to send mail as this Worker. Only call it from code that runs on a server you control.
 - **The API key is checked with a constant-time comparison** (`timingSafeEqual` in `worker.js`), not `===`, so a mistimed network attacker can't incrementally guess it character-by-character.
-- **Use an App Password, never your real Gmail password.** App Passwords are scoped, revocable independently, and don't work if 2-Step Verification is later disabled — all strictly safer than your account password.
 - **Rotate the key** if it's ever committed, logged, or shared somewhere it shouldn't be: `wrangler secret put SEND_EMAIL_API_KEY`.
-- **"From" can't be spoofed.** The sender address is always `GMAIL_SMTP_FROM_ALIAS` (if set) or `GMAIL_SMTP_USER` — and Gmail itself only accepts the alias if it's already a verified Send As address on that account. `/api/send` can't be used to send mail *as* an arbitrary address, only *from* your own authenticated account or its verified aliases.
+- **"From" can't be spoofed.** The sender address is always `SEND_EMAIL_FROM_EMAIL`, a fixed constant in `worker.js` — nothing in the request body can change it. A caller can only ever send *from* that one address.
 - **Header injection is blocked.** `subject` and `fromName` (on both `/api/send` and `/api/contact`) are stripped of `\r\n` before being used in a MIME header, so a caller can't smuggle an extra header (e.g. a fake `Bcc:`) into an outgoing message.
 - Consider adding a [Cloudflare Rate Limiting Rule](https://developers.cloudflare.com/waf/rate-limiting-rules/) on the `worker.lbdev.app/api/send` route if you're worried about a leaked key being used to send a high volume of mail — this project doesn't implement its own rate limiting.
 
@@ -327,9 +314,7 @@ All configuration lives at the top of [`worker.js`](./worker.js) — there's no 
 | `AUTO_REPLY_FROM_NAME` | `LB Dev` | Display name the auto-reply is sent from, and its sign-off |
 | `AUTO_REPLY_SUBJECT` | `Thanks for reaching out - message received` | Subject line of the auto-reply |
 | `AUTO_REPLY_TURNAROUND` | `2-3 business days` | Turnaround time quoted in the auto-reply body |
-| `GMAIL_SMTP_HOST` | `smtp.gmail.com` | Gmail's SMTP hostname |
-| `GMAIL_SMTP_PORT` | `587` | STARTTLS port (not 465/implicit TLS) |
-| `SMTP_EHLO_DOMAIN` | `lbdev.app` | Identifies this client in the EHLO greeting - cosmetic, doesn't need to resolve |
+| `SEND_EMAIL_FROM_EMAIL` | `help@lbdev.app` | "From" address for `/api/send`. Must be on a domain you've enabled Email Routing for |
 | `MAX_SEND_EMAIL_RECIPIENTS` | `10` | Max `to` addresses per `/api/send` request |
 | `MAX_SEND_EMAIL_SUBJECT_LENGTH` | `256` | Truncation cap for `/api/send`'s `subject` |
 | `MAX_SEND_EMAIL_BODY_LENGTH` | `100000` | Truncation cap for `/api/send`'s `text`/`html` body |
@@ -357,8 +342,6 @@ curl -X POST http://localhost:8787/api/send \
   -d '{"to":"test@example.com","subject":"hi","text":"testing locally"}'
 ```
 
-`/api/send` needs outbound TCP on port 587 to actually reach Gmail — if your local network blocks that (common on restrictive corporate/office networks), use `wrangler dev --remote` to run against real Cloudflare infrastructure instead of the local simulator.
-
 To watch live logs from the deployed Worker:
 
 ```bash
@@ -378,16 +361,14 @@ npm run tail
 - **Contact form request blocked by CORS in the browser** — add your site's origin to `CONTACT_FORM_ALLOWED_ORIGINS`, or leave it empty to allow any origin.
 - **Auto-reply never arrives** — check `wrangler tail` for `Contact form auto-reply failed`. If the binding has `destination_address`/`allowed_destination_addresses` set in `wrangler.toml`, remove it — the auto-reply needs to send to arbitrary visitor addresses. Set `AUTO_REPLY_ENABLED = false` to turn it off entirely.
 - **`/api/send` returns `401 Unauthorized`** — the `Authorization: Bearer <key>` header is missing, wrong, or `SEND_EMAIL_API_KEY` isn't set on the Worker (`wrangler secret put SEND_EMAIL_API_KEY`).
-- **`/api/send` returns `502 Failed to send email`** — check `wrangler tail` for the real SMTP error. Common causes: wrong App Password (regenerate it), 2-Step Verification got turned off (App Passwords stop working), `GMAIL_SMTP_USER`/`GMAIL_SMTP_APP_PASSWORD` not set, or a `GMAIL_SMTP_FROM_ALIAS` that isn't a verified Send As address on that account (the `MAIL FROM` step gets rejected — add/verify the alias under Gmail → Settings → Accounts → Send mail as, or unset `GMAIL_SMTP_FROM_ALIAS`).
-- **`/api/send` hangs or times out** — TCP Sockets need a paid Workers plan; on the free plan `connect()` will fail outright. Confirm your plan under the Cloudflare dashboard's Workers & Pages section.
+- **`/api/send` returns `502 Failed to send email`** — check `wrangler tail` for `Missing SEND_EMAIL binding` (add `[[send_email]]` to `wrangler.toml` and redeploy) or a rejected "From" address (`SEND_EMAIL_FROM_EMAIL` must be on a domain you've enabled Email Routing for).
 
 ---
 
 ## Tech stack
 
-- [Cloudflare Workers](https://workers.cloudflare.com/) + [Email Routing](https://developers.cloudflare.com/email-routing/) (inbound email, outbound `send_email` binding)
-- [Cloudflare TCP Sockets](https://developers.cloudflare.com/workers/runtime-apis/tcp-sockets/) (`cloudflare:sockets`) for the raw SMTP connection to Gmail
+- [Cloudflare Workers](https://workers.cloudflare.com/) + [Email Routing](https://developers.cloudflare.com/email-routing/) (inbound email, outbound `send_email` binding for both `/api/contact` and `/api/send`)
 - [`postal-mime`](https://www.npmjs.com/package/postal-mime) for MIME parsing
-- [`mimetext`](https://www.npmjs.com/package/mimetext) for building outbound notification emails
+- [`mimetext`](https://www.npmjs.com/package/mimetext) for building outbound emails
 - [Discord webhooks](https://discord.com/developers/docs/resources/webhook) (forum-thread creation via `thread_name`)
 - [Wrangler](https://developers.cloudflare.com/workers/wrangler/) for local dev / deploy

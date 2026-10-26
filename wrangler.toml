@@ -25,10 +25,13 @@ enabled = false
 persist = true
 head_sampling_rate = 1
 
-# Lets the Worker send emails (fetch() contact form -> notify email) via
-# Cloudflare's native email sending, no third-party API key needed.
-# The destination address used in worker.js (FORWARD_TO_EMAIL) must still be
-# added and verified under Email Routing > Destination Addresses.
+# Lets the Worker send emails - both the contact form's notify/auto-reply
+# emails and the generic /api/send endpoint - via Cloudflare's native email
+# sending, no third-party API key and no TCP Sockets needed (works on the
+# free Workers plan). The destination address(es) used in worker.js
+# (FORWARD_TO_EMAIL, and whatever /api/send is sent to) must be added and
+# verified under Email Routing > Destination Addresses, UNLESS this binding
+# is left unrestricted as below, in which case it can send to any address.
 [[send_email]]
 name = "SEND_EMAIL"
 
@@ -38,31 +41,17 @@ name = "SEND_EMAIL"
 #   Compute > Email Service > Email Routing > Routing Rules
 #   -> Create routing rule -> Action: "Send to a Worker" -> pick this Worker.
 #
-# The fetch() contact form API is reachable at worker.lbdev.app/api/* (see
-# the [[routes]] block above).
+# The fetch() contact form and send-email APIs are reachable at
+# worker.lbdev.app/api/* (see the [[routes]] block above).
 #
-# Both webhook URLs, plus the Gmail SMTP + send-email API credentials, are
-# secrets, not variables - set them with:
+# Both webhook URLs, plus the send-email API key, are secrets, not
+# variables - set them with:
 #   wrangler secret put DISCORD_WEBHOOK_URL
 #   wrangler secret put CONTACT_DISCORD_WEBHOOK_URL
-#   wrangler secret put GMAIL_SMTP_USER            (your Gmail address)
-#   wrangler secret put GMAIL_SMTP_APP_PASSWORD    (an App Password, not your real password -
-#                                                    myaccount.google.com/apppasswords, needs
-#                                                    2-Step Verification enabled first)
 #   wrangler secret put SEND_EMAIL_API_KEY         (a random string, e.g. `openssl rand -hex 32` -
 #                                                    callers of POST /api/send must send this as
 #                                                    `Authorization: Bearer <key>`. Backend-to-backend
 #                                                    only - never embed it in browser/client code.)
-#   wrangler secret put GMAIL_SMTP_FROM_ALIAS      (optional - send as a different address than
-#                                                    GMAIL_SMTP_USER, e.g. help@lbdev.app. Only works
-#                                                    if that address is already a verified "Send As"
-#                                                    alias on the GMAIL_SMTP_USER account - Gmail
-#                                                    Settings > Accounts > Send mail as. Auth always
-#                                                    happens as GMAIL_SMTP_USER either way.)
-#
-# cloudflare:sockets (used by /api/send to speak SMTP) is a native Workers
-# API - no binding or extra config needed, but raw TCP sockets require a
-# paid Workers plan.
 #
 # NOTE ON THE DOMAIN MOVE: renaming `name` above means Cloudflare treats
 # this as a brand new Worker, not a rename of the old lbdev.tech one. After
